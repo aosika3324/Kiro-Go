@@ -2940,6 +2940,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"host":                config.GetHost(),
 		"allowOverUsage":      config.GetAllowOverUsage(),
 		"defaultCacheHitRate": config.GetDefaultCacheHitRate(),
+		"historyRewrite":      config.GetHistoryRewrite(),
 	})
 }
 
@@ -2993,6 +2994,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Password            string   `json:"password,omitempty"`
 		AllowOverUsage      *bool    `json:"allowOverUsage,omitempty"`
 		DefaultCacheHitRate *float64 `json:"defaultCacheHitRate,omitempty"`
+		HistoryRewrite      *bool    `json:"historyRewrite,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3020,6 +3022,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// 更新全局默认缓存命中率（上报口径）
 	if req.DefaultCacheHitRate != nil {
 		if err := config.UpdateDefaultCacheHitRate(*req.DefaultCacheHitRate); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// 更新历史改写开关（默认关闭 = 平滑的 1.1.2 之前行为）
+	if req.HistoryRewrite != nil {
+		if err := config.UpdateHistoryRewrite(*req.HistoryRewrite); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

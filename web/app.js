@@ -1424,6 +1424,9 @@
     if ($('defaultCacheHitRate')) {
       $('defaultCacheHitRate').value = String(Math.round((d.defaultCacheHitRate || 0) * 100));
     }
+    if ($('historyRewrite')) {
+      $('historyRewrite').checked = d.historyRewrite || false;
+    }
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1530,6 +1533,9 @@
   async function saveOverUsageConfig() {
     const allowOverUsage = $('allowOverUsage').checked;
     const body = { allowOverUsage };
+    if ($('historyRewrite')) {
+      body.historyRewrite = $('historyRewrite').checked;
+    }
     const rateEl = $('defaultCacheHitRate');
     if (rateEl) {
       let pct = parseFloat(rateEl.value);

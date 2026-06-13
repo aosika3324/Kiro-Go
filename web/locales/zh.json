@@ -96,6 +96,8 @@
   "settings.overUsageSaved": "超额使用设置已保存",
   "settings.defaultCacheHitRate": "默认缓存命中率 (%)",
   "settings.defaultCacheHitRateHint": "无真实缓存追踪数据时，按此比例向下游上报缓存命中（cache_read / cached_tokens）。仅影响上报口径，不改变上游账号的真实计费。每个 KEY 可单独覆盖此值。",
+  "settings.historyRewrite": "历史改写（1.1.2 上游行为）",
+  "settings.historyRewriteHint": "关闭（默认）：保留结构化工具历史、不做体积截断，多轮输出质量更好（1.1.2 之前的平滑行为）。仅当超长会话频繁触发上游 400「Input is too long」/「Improperly formed request」时再开启，并接受多轮质量下降的代价。",
   "settings.thinkingSettings": "Thinking 模式设置",
   "settings.thinkingSuffix": "触发后缀",
   "settings.thinkingSuffixHint": "模型名称加此后缀即启用思考模式，如 claude-sonnet-4.5-thinking",

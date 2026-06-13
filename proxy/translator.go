@@ -64,6 +64,21 @@ const truncationPlaceholder = "[Earlier conversation history was truncated to fi
 // (in addition to system priming and the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
 
+// historyRewriteEnabled reports whether the v1.1.2 upstream history transforms
+// (sanitizeKiroHistory + truncatePayloadToLimit) are active. It is an indirection
+// over config.GetHistoryRewrite so tests can override it without touching config.
+// Default behavior (flag off) preserves structured tool history with no size cap,
+// matching the smoother pre-1.1.2 request shape. See history-rewrite-gate memory.
+var historyRewriteEnabled = func() bool { return config.GetHistoryRewrite() }
+
+// SetHistoryRewriteForTest overrides the history-rewrite gate and returns a
+// restore function. Test-only.
+func SetHistoryRewriteForTest(on bool) func() {
+	prev := historyRewriteEnabled
+	historyRewriteEnabled = func() bool { return on }
+	return func() { historyRewriteEnabled = prev }
+}
+
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
@@ -274,15 +289,23 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// the last history assistant must carry matching structured toolUses. If not
 	// (orphaned tool results, e.g. after context compaction), flatten them into
 	// the current message text so the upstream does not reject the request.
+	//
+	// When the history-rewrite transforms are disabled (default), we keep the
+	// pre-1.1.2 behavior: structured tool turns are preserved verbatim in history
+	// and the current tool results are always attached structurally. This avoids
+	// the multi-turn output degradation the flattening introduced.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	keepCurrentToolResults := true
+	if historyRewriteEnabled() {
+		keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
-	// Flatten structured tool calls/results that live in history; upstream only
-	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
+		// Flatten structured tool calls/results that live in history; upstream only
+		// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
+		if keepCurrentToolResults {
+			history = sanitizeKiroHistory(history, currentToolResultIDs)
+		} else {
+			history = sanitizeKiroHistory(history, nil)
+		}
 	}
 
 	// 构建最终内容
@@ -339,7 +362,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	if historyRewriteEnabled() {
+		truncatePayloadToLimit(payload, systemPrompt != "")
+	}
 
 	return payload
 }
@@ -1187,12 +1212,19 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			nextIdx := i + 1
 			if nextIdx >= len(nonSystemMessages) || nonSystemMessages[nextIdx].Role != "tool" {
 				if !isLast {
-					// Store the tool results structurally only; sanitizeKiroHistory
-					// narrates them into text exactly once. Pre-filling Content with
-					// buildToolResultsContinuation here would duplicate the output
-					// (continuation text + narrated text).
+					// When the history rewrite is enabled, store the tool results
+					// structurally only; sanitizeKiroHistory narrates them into text
+					// exactly once, so pre-filling Content here would duplicate the
+					// output. When it is disabled (default, pre-1.1.2 behavior) nothing
+					// narrates later, so we must prefill Content with the continuation
+					// text or the history turn would go upstream empty.
+					histContent := ""
+					if !historyRewriteEnabled() {
+						histContent = buildToolResultsContinuation(currentToolResults)
+					}
 					history = append(history, KiroHistoryMessage{
 						UserInputMessage: &KiroUserInputMessage{
+							Content: histContent,
 							ModelID: modelID,
 							Origin:  origin,
 							Images:  currentImages,
@@ -1229,13 +1261,21 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// Decide whether current tool results form a valid active tool turn; if not,
 	// flatten them into the current message text (see ClaudeToKiro for rationale).
+	//
+	// When the history-rewrite transforms are disabled (default), keep the
+	// pre-1.1.2 behavior: structured tool turns are preserved (the tool-result
+	// Content was pre-filled above) and current tool results always attach
+	// structurally.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	keepCurrentToolResults := true
+	if historyRewriteEnabled() {
+		keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
+		if keepCurrentToolResults {
+			history = sanitizeKiroHistory(history, currentToolResultIDs)
+		} else {
+			history = sanitizeKiroHistory(history, nil)
+		}
 	}
 
 	// 构建最终内容
@@ -1287,7 +1327,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	if historyRewriteEnabled() {
+		truncatePayloadToLimit(payload, systemPrompt != "")
+	}
 
 	return payload
 }

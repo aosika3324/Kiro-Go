@@ -192,6 +192,18 @@ type Config struct {
 	// how the upstream account is actually billed.
 	DefaultCacheHitRate float64 `json:"defaultCacheHitRate,omitempty"`
 
+	// HistoryRewrite enables the v1.1.2 upstream conversation-history transforms in
+	// the request translator: flattening historical structured tool_use/tool_result
+	// turns into plain "Tool results:" text (sanitizeKiroHistory) and the hard
+	// payload-size cap that drops oldest turns (truncatePayloadToLimit).
+	//
+	// Default false. When false, history is sent in the pre-1.1.2 form (structured
+	// tool turns preserved, no size cap), which gives better multi-turn output
+	// quality. Enable only if you hit upstream HTTP 400 "Input is too long" /
+	// "Improperly formed request" on very long agent sessions and accept the
+	// quality tradeoff. See [[history-rewrite-gate]].
+	HistoryRewrite bool `json:"historyRewrite,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -852,6 +864,25 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetHistoryRewrite reports whether the v1.1.2 upstream history-rewrite/truncation
+// transforms are enabled. Defaults to false (pre-1.1.2 behavior) when unset or cfg nil.
+func GetHistoryRewrite() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.HistoryRewrite
+}
+
+// UpdateHistoryRewrite sets the history-rewrite switch and persists the change.
+func UpdateHistoryRewrite(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.HistoryRewrite = enabled
 	return Save()
 }
 
