@@ -1404,6 +1404,10 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    // Stored as 0–1 ratio; the UI edits it as a 0–100 percentage.
+    if ($('defaultCacheHitRate')) {
+      $('defaultCacheHitRate').value = String(Math.round((d.defaultCacheHitRate || 0) * 100));
+    }
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1509,7 +1513,15 @@
   }
   async function saveOverUsageConfig() {
     const allowOverUsage = $('allowOverUsage').checked;
-    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
+    const body = { allowOverUsage };
+    const rateEl = $('defaultCacheHitRate');
+    if (rateEl) {
+      let pct = parseFloat(rateEl.value);
+      if (isNaN(pct) || pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      body.defaultCacheHitRate = pct / 100;
+    }
+    await api('/settings', { method: 'POST', body: JSON.stringify(body) });
     toast(t('settings.overUsageSaved'), 'success');
   }
   async function changePassword() {
@@ -1609,6 +1621,13 @@
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
+      // Cache hit rate: configured per-key rate (or "default") + observed ratio.
+      const configuredRate = (item.cacheHitRate != null)
+        ? Math.round(item.cacheHitRate * 100) + '%'
+        : t('apiKeys.cacheRateDefault');
+      const observedRate = Math.round((item.effectiveHitRate || 0) * 100) + '%';
+      const cacheLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.cacheHitRate')) + ': ' +
+        escapeHtml(configuredRate) + ' · ' + escapeHtml(t('apiKeys.cacheObserved')) + ' ' + escapeHtml(observedRate) + '</div>';
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
@@ -1631,6 +1650,7 @@
           tokensLine +
           creditsLine +
           requestsLine +
+          cacheLine +
         '</div>' +
       '</div>';
     }).join('');
@@ -1653,6 +1673,16 @@
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
+    // Per-key cache hit rate is a 0–1 ratio (nil = use global default).
+    // Edit it as 0–100 percent; blank means "inherit global default".
+    const rateEl = $('apiKeyForm_cacheHitRate');
+    if (rateEl) {
+      if (entry && entry.cacheHitRate != null) {
+        rateEl.value = String(Math.round(entry.cacheHitRate * 100));
+      } else {
+        rateEl.value = '';
+      }
+    }
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
     openDialog('apiKeyModal');
@@ -1681,6 +1711,18 @@
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
         creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
       };
+      // Cache hit rate: blank → inherit global default (null on edit), number →
+      // set per-key rate (UI percent → 0–1 ratio).
+      const rateRaw = $('apiKeyForm_cacheHitRate') ? $('apiKeyForm_cacheHitRate').value.trim() : '';
+      if (rateRaw === '') {
+        // On edit, explicitly clear to fall back to the global default.
+        if (apiKeyEditingId) payload.cacheHitRate = null;
+      } else {
+        let pct = parseFloat(rateRaw);
+        if (isNaN(pct) || pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        payload.cacheHitRate = pct / 100;
+      }
       let res, d;
       if (apiKeyEditingId) {
         res = await api('/api-keys/' + encodeURIComponent(apiKeyEditingId), { method: 'PUT', body: JSON.stringify(payload) });

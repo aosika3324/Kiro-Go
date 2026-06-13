@@ -510,6 +510,54 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
+// hasTrackedCacheData reports whether the per-account prefix tracker produced any
+// real cache attribution for this request (read or creation). When false, the
+// reporting layer falls back to the per-key / global policy hit rate.
+func hasTrackedCacheData(usage promptCacheUsage) bool {
+	return usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0
+}
+
+// resolveReportedCacheUsage produces the cache usage numbers reported downstream,
+// using a hybrid policy:
+//
+//   - When the real prefix tracker has data for this request (tracked has any
+//     read/creation tokens), report it verbatim ("honest estimate").
+//   - Otherwise fall back to the API key's configured hit rate (or the global
+//     default), reporting cache_read = round(inputTokens * rate) and
+//     cache_creation = 0 ("policy target value"). Reporting creation = 0 keeps
+//     the downstream-visible hit ratio equal to the configured rate.
+//
+// hitRate is the already-resolved ratio for the matched API key (see
+// config.ResolveCacheHitRate). inputTokens is the total input token count for
+// the request. The returned usage always satisfies
+// billed + read + creation == inputTokens.
+func resolveReportedCacheUsage(inputTokens int, hitRate float64, tracked promptCacheUsage) promptCacheUsage {
+	if hasTrackedCacheData(tracked) {
+		return tracked
+	}
+	if inputTokens <= 0 || hitRate <= 0 {
+		return promptCacheUsage{}
+	}
+	if hitRate > 1 {
+		hitRate = 1
+	}
+	read := int(float64(inputTokens)*hitRate + 0.5)
+	if read > inputTokens {
+		read = inputTokens
+	}
+	if read <= 0 {
+		return promptCacheUsage{}
+	}
+	// Policy hits are reported as 5m ephemeral reads; creation stays 0 so the
+	// downstream-visible hit ratio matches the configured rate exactly.
+	return promptCacheUsage{
+		CacheReadInputTokens:       read,
+		CacheCreationInputTokens:   0,
+		CacheCreation5mInputTokens: 0,
+		CacheCreation1hInputTokens: 0,
+	}
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),

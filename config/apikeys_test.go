@@ -293,3 +293,87 @@ func TestGenerateApiKeyValueIsUnique(t *testing.T) {
 		t.Fatalf("expected non-trivial key length, got %q", a)
 	}
 }
+
+func TestResolveCacheHitRate(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	if err := UpdateDefaultCacheHitRate(0.3); err != nil {
+		t.Fatalf("UpdateDefaultCacheHitRate: %v", err)
+	}
+
+	// Key with explicit rate overrides the global default.
+	rate := 0.8
+	withRate, err := AddApiKey(ApiKeyEntry{Key: "sk-with-rate", Enabled: true, CacheHitRate: &rate})
+	if err != nil {
+		t.Fatalf("AddApiKey withRate: %v", err)
+	}
+	// Key without a rate falls back to the global default.
+	noRate, err := AddApiKey(ApiKeyEntry{Key: "sk-no-rate", Enabled: true})
+	if err != nil {
+		t.Fatalf("AddApiKey noRate: %v", err)
+	}
+
+	if got := ResolveCacheHitRate(withRate.ID); got != 0.8 {
+		t.Fatalf("per-key rate: want 0.8, got %v", got)
+	}
+	if got := ResolveCacheHitRate(noRate.ID); got != 0.3 {
+		t.Fatalf("global fallback: want 0.3, got %v", got)
+	}
+	if got := ResolveCacheHitRate(""); got != 0.3 {
+		t.Fatalf("empty keyID falls back to global: want 0.3, got %v", got)
+	}
+	if got := ResolveCacheHitRate("nonexistent"); got != 0.3 {
+		t.Fatalf("unknown keyID falls back to global: want 0.3, got %v", got)
+	}
+}
+
+func TestDefaultCacheHitRateClamped(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := UpdateDefaultCacheHitRate(1.7); err != nil {
+		t.Fatalf("UpdateDefaultCacheHitRate: %v", err)
+	}
+	if got := GetDefaultCacheHitRate(); got != 1 {
+		t.Fatalf("rate>1 clamped to 1, got %v", got)
+	}
+	if err := UpdateDefaultCacheHitRate(-0.5); err != nil {
+		t.Fatalf("UpdateDefaultCacheHitRate negative: %v", err)
+	}
+	if got := GetDefaultCacheHitRate(); got != 0 {
+		t.Fatalf("negative clamped to 0, got %v", got)
+	}
+}
+
+func TestRecordApiKeyUsageWithCache(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Key: "sk-cache", Enabled: true})
+	if err != nil {
+		t.Fatalf("AddApiKey: %v", err)
+	}
+	if err := RecordApiKeyUsageWithCache(created.ID, 1000, 0, 600, 100); err != nil {
+		t.Fatalf("RecordApiKeyUsageWithCache: %v", err)
+	}
+	entry := GetApiKeyEntry(created.ID)
+	if entry.CacheReadTokens != 600 || entry.CacheCreationTokens != 100 {
+		t.Fatalf("cache counters: read=%d creation=%d", entry.CacheReadTokens, entry.CacheCreationTokens)
+	}
+	if entry.TokensUsed != 1000 {
+		t.Fatalf("tokens used: want 1000, got %d", entry.TokensUsed)
+	}
+	// Reset clears cache counters too.
+	if err := ResetApiKeyUsage(created.ID); err != nil {
+		t.Fatalf("ResetApiKeyUsage: %v", err)
+	}
+	entry = GetApiKeyEntry(created.ID)
+	if entry.CacheReadTokens != 0 || entry.CacheCreationTokens != 0 {
+		t.Fatalf("reset should clear cache counters, got read=%d creation=%d", entry.CacheReadTokens, entry.CacheCreationTokens)
+	}
+}

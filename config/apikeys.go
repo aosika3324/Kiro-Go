@@ -70,9 +70,10 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 
 // UpdateApiKey applies a patch to an existing API key. Patch semantics:
 //   - Name, Key are overwritten when non-empty in patch.
-//   - Enabled, TokenLimit, CreditLimit are always overwritten (zero values are valid).
-//   - Counters (TokensUsed/CreditsUsed/RequestsCount) are not touched here; use
-//     RecordApiKeyUsage or ResetApiKeyUsage instead.
+//   - Enabled, TokenLimit, CreditLimit, CacheHitRate are always overwritten
+//     (zero / nil values are valid: nil CacheHitRate means "use global default").
+//   - Counters (TokensUsed/CreditsUsed/RequestsCount/Cache*) are not touched here;
+//     use RecordApiKeyUsage or ResetApiKeyUsage instead.
 //   - Migrated stays as-is once true; only flips when explicitly set in patch.
 func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfgLock.Lock()
@@ -106,6 +107,7 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
+	cfg.ApiKeys[idx].CacheHitRate = patch.CacheHitRate
 	if patch.Migrated {
 		cfg.ApiKeys[idx].Migrated = true
 	}
@@ -159,6 +161,14 @@ func HasApiKeys() bool {
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
 // updates LastUsedAt, increments RequestsCount, and persists.
 func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+	return RecordApiKeyUsageWithCache(id, tokens, credits, 0, 0)
+}
+
+// RecordApiKeyUsageWithCache is RecordApiKeyUsage plus cache-token attribution.
+// cacheRead / cacheCreation are the reported prompt-cache token counts for this
+// request; they are accumulated for per-key hit-rate display. Negative values
+// are ignored.
+func RecordApiKeyUsageWithCache(id string, tokens int64, credits float64, cacheRead, cacheCreation int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -172,6 +182,12 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 			if credits > 0 {
 				cfg.ApiKeys[i].CreditsUsed += credits
 			}
+			if cacheRead > 0 {
+				cfg.ApiKeys[i].CacheReadTokens += cacheRead
+			}
+			if cacheCreation > 0 {
+				cfg.ApiKeys[i].CacheCreationTokens += cacheCreation
+			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
 			return saveLocked()
@@ -180,8 +196,9 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	return errors.New("api key not found")
 }
 
-// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
-// LastUsedAt is preserved so operators can still see when the key was last used.
+// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount and cache counters
+// for the entry. LastUsedAt is preserved so operators can still see when the key
+// was last used.
 func ResetApiKeyUsage(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -193,6 +210,8 @@ func ResetApiKeyUsage(id string) error {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
+			cfg.ApiKeys[i].CacheReadTokens = 0
+			cfg.ApiKeys[i].CacheCreationTokens = 0
 			return saveLocked()
 		}
 	}

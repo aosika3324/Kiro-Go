@@ -1232,7 +1232,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Hybrid reporting: real prefix-tracker data when available, otherwise the
+		// per-key / global policy hit rate. message_start already carried the
+		// provisional tracked usage; message_delta below carries the final numbers.
+		cacheUsage = resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), cacheUsage)
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1325,11 +1330,18 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
 func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, 0, 0)
+}
+
+// recordSuccessForApiKeyWithCache is recordSuccessForApiKey plus cache-token
+// attribution (the cache_read / cache_creation token counts reported downstream),
+// accumulated per key for hit-rate display.
+func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheRead, cacheCreation int) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+	if err := config.RecordApiKeyUsageWithCache(apiKeyID, int64(inputTokens+outputTokens), credits, int64(cacheRead), int64(cacheCreation)); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
 }
@@ -1412,7 +1424,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Hybrid reporting: real prefix-tracker data when available, otherwise the
+		// per-key / global policy hit rate.
+		cacheUsage = resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), cacheUsage)
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1858,7 +1874,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// OpenAI path has no prefix tracker; report the per-key / global policy
+		// hit rate as cached_tokens so downstream gateways (newapi) see a hit.
+		cacheUsage := resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), promptCacheUsage{})
+		cachedTokens := cacheUsage.CacheReadInputTokens
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -1867,6 +1888,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			finishReason = "tool_calls"
 		}
 
+		usageMap := map[string]interface{}{
+			"prompt_tokens":     inputTokens,
+			"completion_tokens": outputTokens,
+			"total_tokens":      inputTokens + outputTokens,
+		}
+		if cachedTokens > 0 {
+			usageMap["prompt_tokens_details"] = map[string]int{"cached_tokens": cachedTokens}
+		}
 		chunk := map[string]interface{}{
 			"id":      chatID,
 			"object":  "chat.completion.chunk",
@@ -1877,11 +1906,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"delta":         map[string]interface{}{},
 				"finish_reason": finishReason,
 			}},
-			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
-			},
+			"usage": usageMap,
 		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
@@ -1961,12 +1986,17 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// OpenAI path has no prefix tracker; report the per-key / global policy
+		// hit rate as cached_tokens so downstream gateways (newapi) see a hit.
+		cacheUsage := resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), promptCacheUsage{})
+		cachedTokens := cacheUsage.CacheReadInputTokens
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, cachedTokens)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -2312,13 +2342,16 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	h.pool.Reload()
-	// 账号从禁用→启用时，自动拉取并缓存模型列表
-	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
-		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
-			}
-		}(*existing)
+	// 账号从禁用→启用时，清除残留冷却并自动拉取缓存模型列表
+	if !oldEnabled && existing.Enabled {
+		h.pool.ClearCooldown(id)
+		if existing.AccessToken != "" {
+			go func(acc config.Account) {
+				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
+				}
+			}(*existing)
+		}
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -2438,11 +2471,15 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			idSet[id] = true
 		}
 		var toRefreshModels []config.Account
+		var toClearCooldown []string
 		for _, a := range accounts {
 			if idSet[a.ID] {
-				// 记录本次从禁用→启用、且有 token 的账号
-				if enabled && !a.Enabled && a.AccessToken != "" {
-					toRefreshModels = append(toRefreshModels, a)
+				// 记录本次从禁用→启用的账号
+				if enabled && !a.Enabled {
+					toClearCooldown = append(toClearCooldown, a.ID)
+					if a.AccessToken != "" {
+						toRefreshModels = append(toRefreshModels, a)
+					}
 				}
 				a.Enabled = enabled
 				if enabled && a.BanStatus != "" && a.BanStatus != "ACTIVE" {
@@ -2454,6 +2491,10 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		h.pool.Reload()
+		// 清除本次新启用账号的残留冷却，避免被旧的禁用/超额冷却挡在轮询外
+		for _, id := range toClearCooldown {
+			h.pool.ClearCooldown(id)
+		}
 		// 为本次新启用的账号异步拉取模型缓存
 		for _, acc := range toRefreshModels {
 			go func(a config.Account) {
@@ -2902,11 +2943,12 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":              config.GetApiKey(),
+		"requireApiKey":       config.IsApiKeyRequired(),
+		"port":                config.GetPort(),
+		"host":                config.GetHost(),
+		"allowOverUsage":      config.GetAllowOverUsage(),
+		"defaultCacheHitRate": config.GetDefaultCacheHitRate(),
 	})
 }
 
@@ -2955,10 +2997,11 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey              *string  `json:"apiKey,omitempty"`
+		RequireApiKey       *bool    `json:"requireApiKey,omitempty"`
+		Password            string   `json:"password,omitempty"`
+		AllowOverUsage      *bool    `json:"allowOverUsage,omitempty"`
+		DefaultCacheHitRate *float64 `json:"defaultCacheHitRate,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2981,6 +3024,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
+	}
+
+	// 更新全局默认缓存命中率（上报口径）
+	if req.DefaultCacheHitRate != nil {
+		if err := config.UpdateDefaultCacheHitRate(*req.DefaultCacheHitRate); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

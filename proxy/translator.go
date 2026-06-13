@@ -963,9 +963,17 @@ type OpenAIChoice struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                        `json:"prompt_tokens"`
+	CompletionTokens    int                        `json:"completion_tokens"`
+	TotalTokens         int                        `json:"total_tokens"`
+	PromptTokensDetails *OpenAIPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// OpenAIPromptTokensDetails mirrors OpenAI's usage.prompt_tokens_details object.
+// cached_tokens is the portion of prompt_tokens served from the prompt cache;
+// downstream gateways (newapi etc.) read this to compute cache hit rate.
+type OpenAIPromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // ==================== OpenAI -> Kiro 转换 ====================
@@ -1570,7 +1578,7 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string, cachedTokens int) map[string]interface{} {
 	finishReason := "stop"
 
 	message := map[string]interface{}{
@@ -1620,10 +1628,16 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			"message":       message,
 			"finish_reason": finishReason,
 		}},
-		"usage": map[string]int{
-			"prompt_tokens":     inputTokens,
-			"completion_tokens": outputTokens,
-			"total_tokens":      inputTokens + outputTokens,
-		},
+		"usage": func() map[string]interface{} {
+			u := map[string]interface{}{
+				"prompt_tokens":     inputTokens,
+				"completion_tokens": outputTokens,
+				"total_tokens":      inputTokens + outputTokens,
+			}
+			if cachedTokens > 0 {
+				u["prompt_tokens_details"] = map[string]int{"cached_tokens": cachedTokens}
+			}
+			return u
+		}(),
 	}
 }

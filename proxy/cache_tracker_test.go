@@ -262,3 +262,59 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
 	}
 }
+
+func TestResolveReportedCacheUsagePrefersTrackedData(t *testing.T) {
+	tracked := promptCacheUsage{
+		CacheReadInputTokens:       800,
+		CacheCreationInputTokens:   200,
+		CacheCreation5mInputTokens: 200,
+	}
+	// Even with a policy rate set, real tracked data wins verbatim.
+	got := resolveReportedCacheUsage(2000, 0.5, tracked)
+	if got != tracked {
+		t.Fatalf("expected tracked usage returned verbatim, got %+v", got)
+	}
+}
+
+func TestResolveReportedCacheUsageFallsBackToPolicyRate(t *testing.T) {
+	// No tracked data → use the policy hit rate to synthesize cache_read.
+	got := resolveReportedCacheUsage(1000, 0.7, promptCacheUsage{})
+	if got.CacheReadInputTokens != 700 {
+		t.Fatalf("expected 700 cache_read at rate 0.7, got %d", got.CacheReadInputTokens)
+	}
+	if got.CacheCreationInputTokens != 0 {
+		t.Fatalf("policy hits must report 0 creation, got %d", got.CacheCreationInputTokens)
+	}
+	// Conservation: billed + read + creation == input.
+	billed := billedClaudeInputTokens(1000, got)
+	if billed+got.CacheReadInputTokens+got.CacheCreationInputTokens != 1000 {
+		t.Fatalf("token conservation violated: billed=%d read=%d creation=%d", billed, got.CacheReadInputTokens, got.CacheCreationInputTokens)
+	}
+}
+
+func TestResolveReportedCacheUsageZeroRateReportsNothing(t *testing.T) {
+	got := resolveReportedCacheUsage(1000, 0, promptCacheUsage{})
+	if got.CacheReadInputTokens != 0 || got.CacheCreationInputTokens != 0 {
+		t.Fatalf("zero rate must report no cache, got %+v", got)
+	}
+}
+
+func TestResolveReportedCacheUsageClampsAndRounds(t *testing.T) {
+	// Rate >1 is clamped to full input.
+	got := resolveReportedCacheUsage(500, 1.5, promptCacheUsage{})
+	if got.CacheReadInputTokens != 500 {
+		t.Fatalf("rate>1 should clamp read to input(500), got %d", got.CacheReadInputTokens)
+	}
+	// Rounding: 333 * 0.5 = 166.5 → 167.
+	got = resolveReportedCacheUsage(333, 0.5, promptCacheUsage{})
+	if got.CacheReadInputTokens != 167 {
+		t.Fatalf("expected rounded 167, got %d", got.CacheReadInputTokens)
+	}
+}
+
+func TestResolveReportedCacheUsageZeroInputSafe(t *testing.T) {
+	got := resolveReportedCacheUsage(0, 0.9, promptCacheUsage{})
+	if got.CacheReadInputTokens != 0 {
+		t.Fatalf("zero input must report no cache, got %+v", got)
+	}
+}
