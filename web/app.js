@@ -45,19 +45,34 @@
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, '&quot;');
   }
-  async function copyText(text) {
+  async function copyText(input) {
+    const isPromise = input && typeof input.then === 'function';
+    if (isPromise && typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
+      const blobPromise = Promise.resolve(input).then(t => new Blob([String(t == null ? '' : t)], { type: 'text/plain' }));
+      await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blobPromise })]);
+      return;
+    }
+    const text = isPromise ? await input : input;
+    const str = String(text == null ? '' : text);
     if (navigator.clipboard && navigator.clipboard.writeText) {
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(str);
         return;
       } catch (e) { }
     }
     const ta = document.createElement('textarea');
-    ta.value = text;
+    ta.value = str;
+    ta.readOnly = true;
     ta.className = 'clipboard-proxy';
     document.body.appendChild(ta);
-    ta.select();
+    const range = document.createRange();
+    range.selectNodeContents(ta);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    ta.setSelectionRange(0, str.length);
     document.execCommand('copy');
+    sel.removeAllRanges();
     document.body.removeChild(ta);
   }
   function renderEndpointCode(id, value) {
@@ -911,12 +926,13 @@
   }
   async function copyAccountJSON(id, btn) {
     try {
-      const res = await api('/accounts/' + id + '/full');
-      if (!res.ok) throw new Error('Failed');
-      const a = await res.json();
-      const { clientId, clientSecret, accessToken, refreshToken } = a;
-      const json = JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
-      await copyText(json);
+      const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
+        if (!res.ok) throw new Error('Failed');
+        const a = await res.json();
+        const { clientId, clientSecret, accessToken, refreshToken } = a;
+        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+      });
+      await copyText(jsonPromise);
       flashCopySuccess(btn);
       toastPrimary(t('accounts.copyJSONSuccess'));
     } catch (e) {
@@ -2165,6 +2181,7 @@
       accessToken: tokenData.accessToken || '',
       clientId: clientData?.clientId || '',
       clientSecret: clientData?.clientSecret || '',
+      region: tokenData.region || '',
       authMethod, provider
     };
     const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2446,14 +2463,21 @@
     $('exportJsonText').value = JSON.stringify(data, null, 2);
   }
   async function exportCopyJson() {
-    const data = await getExportData();
-    if (!data) return;
-    const filtered = (data.accounts || []).map(a => {
-      const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
-      return { clientId, clientSecret, accessToken, refreshToken };
+    if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
+    const jsonPromise = getExportData().then(data => {
+      if (!data) throw new Error('no-data');
+      const filtered = (data.accounts || []).map(a => {
+        const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
+        return { clientId, clientSecret, accessToken, refreshToken };
+      });
+      return JSON.stringify(filtered, null, 2);
     });
-    await copyText(JSON.stringify(filtered, null, 2));
-    toast(t('export.copied'), 'primary');
+    try {
+      await copyText(jsonPromise);
+      toast(t('export.copied'), 'primary');
+    } catch (e) {
+      if (e && e.message !== 'no-data') toastError(t('common.failed'));
+    }
   }
   async function exportDownloadJson() {
     const data = await getExportData();
@@ -2528,7 +2552,8 @@
     if (status === 'available') {
       toast(t('update.availableToast') + (latest ? ': ' + latest : ''), 'warning', {
         icon: 'fa-solid fa-arrow-up',
-        duration: 5200
+        duration: 5200,
+        onClick: function () { checkUpdate(true); }
       });
       return;
     }
