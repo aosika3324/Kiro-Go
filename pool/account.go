@@ -12,6 +12,19 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// copyAccount returns a heap copy of a, or nil when a is nil. Pool getters return
+// copies (not pointers into p.accounts) so the returned value can be read and
+// mutated by a request goroutine without racing a concurrent Reload()/UpdateToken
+// that rewrites the backing array under p.mu. Write propagation back to the pool
+// always happens by ID (UpdateToken/UpdateStats), never through the returned pointer.
+func copyAccount(a *config.Account) *config.Account {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	return &cp
+}
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
@@ -115,14 +128,16 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		return acc
+		return copyAccount(acc)
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）。
+	// 降级路径也从 currentIndex 起轮转扫描，避免持续高压下把负载集中到首个账号。
 	var best *config.Account
 	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
+	for i := 0; i < n; i++ {
+		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+		acc := &p.accounts[idx]
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
@@ -135,10 +150,10 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return copyAccount(acc)
 		}
 	}
-	return best
+	return copyAccount(best)
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -226,14 +241,15 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		return acc
+		return copyAccount(acc)
 	}
 
-	// fallback：找冷却时间最短且支持该模型的账号
+	// fallback：找冷却时间最短且支持该模型的账号，同样从 currentIndex 起轮转扫描。
 	var best *config.Account
 	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
+	for i := 0; i < n; i++ {
+		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+		acc := &p.accounts[idx]
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
@@ -249,19 +265,19 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return copyAccount(acc)
 		}
 	}
-	return best
+	return copyAccount(best)
 }
 
-// GetByID 根据 ID 获取账号
+// GetByID 根据 ID 获取账号（返回副本，避免调用方持有指向 backing array 的指针）
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			return copyAccount(&p.accounts[i])
 		}
 	}
 	return nil
@@ -275,20 +291,32 @@ func (p *AccountPool) RecordSuccess(id string) {
 	p.errorCounts[id] = 0
 }
 
-// RecordError 记录请求错误，设置冷却
+// RecordError 记录请求错误，设置冷却。
+// 冷却只会被延长，绝不会被缩短：一个已有的长配额冷却不会被随后的短瞬时冷却覆盖。
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.errorCounts[id]++
-
+	var candidate time.Time
 	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
-	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = time.Now().Add(time.Minute)
+		// 配额错误，冷却 1 小时。配额错误不计入瞬时错误阈值。
+		candidate = time.Now().Add(time.Hour)
+	} else {
+		p.errorCounts[id]++
+		if p.errorCounts[id] >= 3 {
+			// 连续 3 次非配额错误，冷却 1 分钟
+			candidate = time.Now().Add(time.Minute)
+		}
 	}
+
+	if candidate.IsZero() {
+		return
+	}
+	// 只延长，不缩短：取现有冷却与候选冷却的较晚者。
+	if existing, ok := p.cooldowns[id]; ok && existing.After(candidate) {
+		return
+	}
+	p.cooldowns[id] = candidate
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
@@ -319,22 +347,35 @@ func IsAuthFailure(err error) bool {
 	return false
 }
 
-// hasStatusToken returns true when status appears in s with non-digit boundaries
-// on both sides, so "401" matches "HTTP 401 from ..." but not "request_401abc".
+// hasStatusToken returns true when status appears in s as a standalone token,
+// i.e. with non-alphanumeric, non-underscore boundaries on both sides. So "401"
+// matches "HTTP 401 from ...", "status (401)", but NOT "request_401abc",
+// "status4010", or "x401y" — avoiding routing a healthy account into the
+// destructive DisableAccount on a digit that happens to live inside a request ID.
 func hasStatusToken(s, status string) bool {
 	for {
 		idx := strings.Index(s, status)
 		if idx < 0 {
 			return false
 		}
-		leftOK := idx == 0 || !isDigit(s[idx-1])
+		leftOK := idx == 0 || !isTokenChar(s[idx-1])
 		rightIdx := idx + len(status)
-		rightOK := rightIdx >= len(s) || !isDigit(s[rightIdx])
+		rightOK := rightIdx >= len(s) || !isTokenChar(s[rightIdx])
 		if leftOK && rightOK {
 			return true
 		}
 		s = s[idx+len(status):]
 	}
+}
+
+// isTokenChar reports whether b is a character that can be part of an identifier
+// token (letter, digit, or underscore). Used as the boundary test for status-code
+// matching so codes embedded in identifiers (request IDs etc.) are not matched.
+func isTokenChar(b byte) bool {
+	return isDigit(b) ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		b == '_'
 }
 
 func isDigit(b byte) bool {
@@ -372,11 +413,25 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 
 // MarkOverLimit marks an account as over usage limit (after a 402 / OVERAGE response).
 // With the upstream OverageStatus model, the live status is refreshed via
-// FetchOverageStatus from the request handler; here we just cooldown briefly so
+// FetchOverageStatus from the request handler; here we just cooldown for an hour so
 // the next attempt picks a different account, then reload.
 func (p *AccountPool) MarkOverLimit(id string) {
 	p.mu.Lock()
 	p.cooldowns[id] = time.Now().Add(time.Hour)
+	p.mu.Unlock()
+	p.Reload()
+}
+
+// ClearCooldown removes any active cooldown and resets the consecutive error
+// counter for an account, then rebuilds the pool. Call this when an operator
+// re-enables a previously disabled / over-limit account: without it, the lingering
+// 24h (DisableAccount) or 1h (MarkOverLimit) cooldown would keep the account out of
+// rotation, and RecordSuccess (the only other clear path) can never fire because
+// the account is never dispatched.
+func (p *AccountPool) ClearCooldown(id string) {
+	p.mu.Lock()
+	delete(p.cooldowns, id)
+	delete(p.errorCounts, id)
 	p.mu.Unlock()
 	p.Reload()
 }

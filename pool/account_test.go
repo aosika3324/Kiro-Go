@@ -325,3 +325,182 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+// --- Regression tests for pool routing fixes ---
+
+// Bug 1: getters must return a copy, not a pointer into the backing array, so
+// callers can mutate the result without racing Reload()/UpdateToken.
+func TestGetNextReturnsCopyNotBackingPointer(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a", Enabled: true, AccessToken: "orig"})
+
+	acc := p.GetNext()
+	if acc == nil {
+		t.Fatal("expected an account")
+	}
+	// Mutating the returned account must NOT change the pool's backing array.
+	acc.AccessToken = "mutated"
+
+	p.mu.RLock()
+	backing := p.accounts[0].AccessToken
+	p.mu.RUnlock()
+	if backing != "orig" {
+		t.Fatalf("mutation leaked into backing array: got %q, want %q", backing, "orig")
+	}
+}
+
+func TestGetByIDReturnsCopyNotBackingPointer(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a", Enabled: true, AccessToken: "orig"})
+	acc := p.GetByID("a")
+	if acc == nil {
+		t.Fatal("expected account a")
+	}
+	acc.AccessToken = "mutated"
+	p.mu.RLock()
+	backing := p.accounts[0].AccessToken
+	p.mu.RUnlock()
+	if backing != "orig" {
+		t.Fatalf("GetByID leaked mutation into backing array: got %q", backing)
+	}
+}
+
+// Bug 2: a non-quota error must never shorten an existing longer (quota) cooldown.
+func TestRecordErrorDoesNotShortenQuotaCooldown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a", Enabled: true})
+
+	// Quota error → 1h cooldown.
+	p.RecordError("a", true)
+	p.mu.RLock()
+	afterQuota := p.cooldowns["a"]
+	p.mu.RUnlock()
+
+	// Three subsequent non-quota errors would set a 1m cooldown; must not win.
+	p.RecordError("a", false)
+	p.RecordError("a", false)
+	p.RecordError("a", false)
+
+	p.mu.RLock()
+	final := p.cooldowns["a"]
+	p.mu.RUnlock()
+
+	if final.Before(afterQuota) {
+		t.Fatalf("non-quota error shortened quota cooldown: quota=%v final=%v", afterQuota, final)
+	}
+	// Should still be ~1h out, not ~1m.
+	if final.Before(time.Now().Add(30 * time.Minute)) {
+		t.Fatalf("expected cooldown to remain ~1h, got %v", final)
+	}
+}
+
+// Bug 2b: quota errors should not count toward the >=3 transient-error threshold.
+func TestRecordErrorQuotaDoesNotCountTowardTransientThreshold(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a", Enabled: true})
+	// Two quota errors then one non-quota: errorCounts should be 1 (only the
+	// non-quota one counts), so no transient cooldown is triggered by count.
+	p.RecordError("a", true)
+	p.RecordError("a", true)
+	p.mu.RLock()
+	count := p.errorCounts["a"]
+	p.mu.RUnlock()
+	if count != 0 {
+		t.Fatalf("quota errors must not increment transient counter, got %d", count)
+	}
+}
+
+// Bug 3: status codes embedded in identifiers must not trigger auth-failure.
+func TestHasStatusTokenBoundaries(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"HTTP 401 from upstream", true},
+		{"status (403)", true},
+		{"got 401", true},
+		{"x-amzn-requestid: request_401abc", false},
+		{"status4010", false},
+		{"id=x401y", false},
+		{"err 4011", false},
+	}
+	for _, c := range cases {
+		if got := IsAuthFailure(errors.New(c.msg)); got != c.want {
+			t.Errorf("IsAuthFailure(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+}
+
+// Bug 4: ClearCooldown must remove a lingering cooldown and reset error count so a
+// re-enabled account becomes routable again.
+func TestClearCooldownReinstatesAccount(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	p := newTestPool(config.Account{ID: "a", Enabled: true})
+	p.RecordError("a", true) // 1h cooldown
+	p.errorCounts["a"] = 5
+
+	p.ClearCooldown("a")
+
+	p.mu.RLock()
+	_, hasCooldown := p.cooldowns["a"]
+	count := p.errorCounts["a"]
+	p.mu.RUnlock()
+	if hasCooldown {
+		t.Fatal("ClearCooldown should remove the cooldown")
+	}
+	if count != 0 {
+		t.Fatalf("ClearCooldown should reset error count, got %d", count)
+	}
+}
+
+// Bug 5: the degraded fallback path scans from currentIndex (rotation-aware) so
+// that, among non-cooling accounts the main loop skipped (e.g. near-expiry tokens),
+// it doesn't always hand back the same index-0 account. When EVERY account is
+// cooling, however, the fallback intentionally returns the earliest-cooldown
+// account — the one soonest to recover — which maximizes availability rather than
+// rotating onto an account that is cooling for much longer.
+func TestFallbackReturnsEarliestCoolingAccount(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+		config.Account{ID: "c", Enabled: true},
+	)
+	now := time.Now()
+	p.cooldowns["a"] = now.Add(3 * time.Hour)
+	p.cooldowns["b"] = now.Add(1 * time.Hour) // earliest → soonest to recover
+	p.cooldowns["c"] = now.Add(2 * time.Hour)
+
+	for i := 0; i < 10; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("fallback should still return a cooling account, got nil")
+		}
+		if acc.ID != "b" {
+			t.Fatalf("fallback should return the earliest-cooldown account b, got %s", acc.ID)
+		}
+	}
+}
+
+// Bug 5b: in the fallback's non-cooling branch (accounts the main loop skipped due
+// to near-expiry tokens, not cooldown), selection rotates via currentIndex instead
+// of always returning the first by slice order.
+func TestFallbackRotatesAmongNonCoolingSkippedAccounts(t *testing.T) {
+	soonExpiry := time.Now().Unix() + tokenRefreshSkewSeconds - 10 // within skew → main loop skips
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true, ExpiresAt: soonExpiry},
+		config.Account{ID: "b", Enabled: true, ExpiresAt: soonExpiry},
+		config.Account{ID: "c", Enabled: true, ExpiresAt: soonExpiry},
+	)
+	// None are cooling; all are near-expiry so the main loop skips them and the
+	// fallback (which ignores expiry) returns them. It should rotate across IDs.
+	seen := make(map[string]bool)
+	for i := 0; i < 30; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("fallback should return a near-expiry account for refresh, got nil")
+		}
+		seen[acc.ID] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("fallback did not rotate among near-expiry accounts: only saw %v", seen)
+	}
+}
