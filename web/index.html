@@ -107,6 +107,8 @@
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
+            <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-rss tab-icon"></i><span
+                data-i18n="tabs.logs"></span></button>
           </div>
         </nav>
         <div class="topbar-actions flex-wrap justify-end">
@@ -228,6 +230,7 @@
           </div>
 
           <div id="accountsList"></div>
+          <div id="accountsPagination" class="pagination hidden"></div>
         </div>
       </div>
 
@@ -485,6 +488,47 @@
           </div>
           <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.statsHint"></span></p>
         </section>
+      </div>
+
+      <!-- Logs tab -->
+      <div id="tabLogs" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="logs.title"></span>
+            <div class="card-actions">
+              <span class="log-status" id="logStatus" data-status="off">
+                <span class="log-status-dot"></span><span id="logStatusText" data-i18n="logs.statusOff"></span>
+              </span>
+              <button class="btn btn-outline btn-sm" id="logPauseBtn" type="button">
+                <i class="fa-solid fa-pause" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.pause"></span>
+              </button>
+              <button class="btn btn-outline btn-sm" id="logClearBtn" type="button">
+                <i class="fa-solid fa-trash" aria-hidden="true"></i><span class="btn-text" data-i18n="logs.clear"></span>
+              </button>
+            </div>
+          </div>
+          <p class="api-hint"><i class="fa-solid fa-circle-info"></i><span data-i18n="logs.hint"></span></p>
+          <div class="log-table-wrap">
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th data-i18n="logs.colTime"></th>
+                  <th data-i18n="logs.colAccount"></th>
+                  <th data-i18n="logs.colIp"></th>
+                  <th data-i18n="logs.colKey"></th>
+                  <th data-i18n="logs.colModel"></th>
+                  <th class="num" data-i18n="logs.colInput"></th>
+                  <th class="num" data-i18n="logs.colOutput"></th>
+                  <th class="num" data-i18n="logs.colCacheRead"></th>
+                  <th class="num" data-i18n="logs.colCacheWrite"></th>
+                  <th class="num" data-i18n="logs.colCredits"></th>
+                </tr>
+              </thead>
+              <tbody id="logTableBody"></tbody>
+            </table>
+            <div id="logEmpty" class="empty-state" data-i18n="logs.empty"></div>
+          </div>
+        </div>
       </div>
     </div>
 

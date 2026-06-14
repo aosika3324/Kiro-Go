@@ -11,6 +11,9 @@ import (
 // so it cannot collide with keys defined in other packages.
 type apiKeyContextKey struct{}
 
+// clientIPContextKey is the context key for the resolved caller IP.
+type clientIPContextKey struct{}
+
 // authError describes why authentication failed. status is the HTTP status code to send.
 type authError struct {
 	status  int
@@ -107,6 +110,48 @@ func apiKeyIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	if v, ok := ctx.Value(apiKeyContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// resolveClientIP extracts the caller IP from the request, honoring the first
+// X-Forwarded-For hop and X-Real-IP (set by reverse proxies / load balancers),
+// falling back to the TCP RemoteAddr. The port is stripped from RemoteAddr.
+func resolveClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// XFF is a comma-separated list; the left-most entry is the original client.
+		if idx := strings.IndexByte(xff, ','); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		return xrip
+	}
+	addr := r.RemoteAddr
+	// Strip the port: "ip:port" or "[ipv6]:port".
+	if idx := strings.LastIndexByte(addr, ':'); idx >= 0 {
+		host := addr[:idx]
+		host = strings.TrimPrefix(host, "[")
+		host = strings.TrimSuffix(host, "]")
+		return host
+	}
+	return addr
+}
+
+// withClientIPContext attaches the resolved caller IP to the request context.
+func withClientIPContext(r *http.Request) *http.Request {
+	ctx := context.WithValue(r.Context(), clientIPContextKey{}, resolveClientIP(r))
+	return r.WithContext(ctx)
+}
+
+// clientIPFromContext returns the caller IP stored in ctx, or empty string.
+func clientIPFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(clientIPContextKey{}).(string); ok {
 		return v
 	}
 	return ""

@@ -17,6 +17,8 @@
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
+  let currentPage = 1;
+  const ACCOUNTS_PER_PAGE = 12;
   let privacyModeEnabled = true;
   let promptRules = [];
   let builderIdSession = '';
@@ -33,6 +35,12 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+
+  // Live request log state
+  let logEventSource = null;   // active EventSource, or null when disconnected
+  let logPaused = false;       // when true, stop appending new rows (stream stays open)
+  let logRows = [];            // most-recent-first buffer of RequestLogEntry
+  const LOG_MAX_ROWS = 500;    // cap rendered rows to match server ring buffer
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -573,6 +581,8 @@
     sessionStorage.removeItem('admin_login_time');
     localStorage.removeItem('admin_password');
     localStorage.removeItem('admin_login_time');
+    // Clear the SSE auth cookie mirrored by ensureAdminCookie.
+    document.cookie = 'admin_password=; path=/admin; max-age=0; SameSite=Strict';
     password = '';
   }
   function getActiveLoginTime() {
@@ -684,6 +694,7 @@
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
     filterStatus = $('filterStatusSelect').value;
+    currentPage = 1;
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -802,9 +813,16 @@
     const filtered = getFilteredAccounts();
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
+      renderPagination(0);
       return;
     }
-    container.innerHTML = filtered.map(a => {
+    // Clamp current page into range (filter changes may shrink the result set).
+    const totalPages = Math.max(1, Math.ceil(filtered.length / ACCOUNTS_PER_PAGE));
+    if (currentPage > totalPages) currentPage = totalPages;
+    if (currentPage < 1) currentPage = 1;
+    const startIdx = (currentPage - 1) * ACCOUNTS_PER_PAGE;
+    const pageItems = filtered.slice(startIdx, startIdx + ACCOUNTS_PER_PAGE);
+    container.innerHTML = pageItems.map(a => {
       const usagePct = (a.usagePercent || 0) * 100;
       const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
       const trialPct = (a.trialUsagePercent || 0) * 100;
@@ -873,6 +891,52 @@
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+    renderPagination(filtered.length);
+  }
+
+  // Renders the account pagination bar for `total` filtered accounts. Hidden when
+  // everything fits on one page. Page buttons re-render via goToPage.
+  function renderPagination(total) {
+    const el = $('accountsPagination');
+    if (!el) return;
+    const totalPages = Math.ceil(total / ACCOUNTS_PER_PAGE);
+    if (totalPages <= 1) {
+      el.classList.add('hidden');
+      el.innerHTML = '';
+      return;
+    }
+    el.classList.remove('hidden');
+
+    // Build a compact page list: first, last, current±1, with ellipses.
+    const pages = [];
+    const push = p => { if (!pages.includes(p) && p >= 1 && p <= totalPages) pages.push(p); };
+    push(1);
+    for (let p = currentPage - 1; p <= currentPage + 1; p++) push(p);
+    push(totalPages);
+    pages.sort((a, b) => a - b);
+
+    let html = '';
+    html += '<button class="page-btn page-nav" data-page="' + (currentPage - 1) + '"' +
+      (currentPage <= 1 ? ' disabled' : '') + ' aria-label="' + escapeAttr(t('pagination.prev')) + '">&lsaquo;</button>';
+    let prev = 0;
+    for (const p of pages) {
+      if (prev && p - prev > 1) html += '<span class="page-ellipsis">…</span>';
+      html += '<button class="page-btn' + (p === currentPage ? ' active' : '') + '" data-page="' + p + '">' + p + '</button>';
+      prev = p;
+    }
+    html += '<button class="page-btn page-nav" data-page="' + (currentPage + 1) + '"' +
+      (currentPage >= totalPages ? ' disabled' : '') + ' aria-label="' + escapeAttr(t('pagination.next')) + '">&rsaquo;</button>';
+    html += '<span class="page-info">' + escapeHtml(t('pagination.info', currentPage, totalPages, total)) + '</span>';
+    el.innerHTML = html;
+  }
+
+  function goToPage(p) {
+    if (p < 1) return;
+    currentPage = p;
+    renderAccounts();
+    // Keep the list head in view when paging.
+    const list = $('accountsList');
+    if (list) list.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
   // Account actions
@@ -2174,7 +2238,7 @@
         return;
       }
     }
-    let ok = 0, fail = 0, newIds = [];
+    let ok = 0, fail = 0, dup = 0, newIds = [];
     for (const item of items) {
       if (!item.refreshToken) { fail++; continue; }
       let authMethod = item.authMethod || '';
@@ -2196,12 +2260,14 @@
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
         const d = await res.json();
         if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+        else if (d.duplicate) dup++;
         else fail++;
       } catch { fail++; }
     }
     closeModal(); loadAccounts(); loadStats();
     let msg = t('sso.importSuccess', ok);
     if (fail > 0) msg += t('sso.importPartial', fail);
+    if (dup > 0) msg += t('credentials.importDuplicate', dup);
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
     newIds.forEach(autoRefreshNewAccount);
@@ -2242,6 +2308,8 @@
       closeModal(); loadAccounts(); loadStats();
       toastPrimary(t('cookie.importSuccess') + ': ' + (d.account?.email || d.account?.id));
       autoRefreshNewAccount(d.account?.id);
+    } else if (d.duplicate) {
+      toastWarning(t('credentials.duplicateOne'));
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
   async function importSsoToken() {
@@ -2256,8 +2324,10 @@
       closeModal(); loadAccounts(); loadStats();
       const count = d.accounts?.length || 0;
       const errs = d.errors?.length || 0;
+      const dup = d.skipped || 0;
       let msg = t('sso.importSuccess', count);
       if (errs > 0) msg += t('sso.importPartial', errs);
+      if (dup > 0) msg += t('credentials.importDuplicate', dup);
       toastPrimary(msg, { duration: 5200 });
       if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
@@ -2285,7 +2355,10 @@
     builderIdPollTimer = setTimeout(async () => {
       const res = await api('/auth/builderid/poll', { method: 'POST', body: JSON.stringify({ sessionId: builderIdSession }) });
       const d = await res.json();
-      if (d.completed) {
+      if (d.duplicate) {
+        toastWarning(t('credentials.duplicateOne'));
+        cancelBuilderIdLogin();
+      } else if (d.completed) {
         closeModal(); loadAccounts(); loadStats();
         toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
         autoRefreshNewAccount(d.account?.id);
@@ -2315,6 +2388,8 @@
         closeModal(); loadAccounts(); loadStats();
         toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
         autoRefreshNewAccount(d.account?.id);
+      } else if (d.duplicate) {
+        toastWarning(t('credentials.duplicateOne'));
       } else toastError(t('common.failed') + ': ' + (d.error || ''));
     } else {
       const res = await api('/auth/iam-sso/start', {
@@ -2554,6 +2629,118 @@
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    if (tab === 'logs') startLogStream();
+    else stopLogStream();
+  }
+
+  // ===== Live request log =====
+  function setLogStatus(state) {
+    const el = $('logStatus');
+    if (!el) return;
+    el.dataset.status = state; // off | live | paused
+    const txt = $('logStatusText');
+    if (txt) {
+      txt.textContent = state === 'live' ? t('logs.statusLive')
+        : state === 'paused' ? t('logs.statusPaused')
+          : t('logs.statusOff');
+    }
+  }
+  // EventSource cannot send the X-Admin-Password header, so mirror the password
+  // into a short-lived cookie that the admin API also accepts. Path-scoped to
+  // /admin so it isn't sent to the proxied AI endpoints.
+  function ensureAdminCookie() {
+    if (!password) return;
+    document.cookie = 'admin_password=' + encodeURIComponent(password) +
+      '; path=/admin; max-age=86400; SameSite=Strict';
+  }
+  async function startLogStream() {
+    if (logEventSource) return; // already connected
+    ensureAdminCookie();
+    // Seed with recent history first so the table isn't empty on open.
+    try {
+      const res = await api('/logs?limit=' + LOG_MAX_ROWS);
+      if (res.ok) {
+        const d = await res.json();
+        logRows = (d.logs || []).slice().reverse(); // newest first
+        renderLogs();
+      }
+    } catch (e) { /* non-fatal: stream will fill it */ }
+
+    try {
+      logEventSource = new EventSource('/admin/api/logs/stream');
+    } catch (e) {
+      setLogStatus('off');
+      return;
+    }
+    logEventSource.addEventListener('open', () => setLogStatus(logPaused ? 'paused' : 'live'));
+    logEventSource.addEventListener('log', ev => {
+      if (logPaused) return;
+      try {
+        const entry = JSON.parse(ev.data);
+        logRows.unshift(entry);
+        if (logRows.length > LOG_MAX_ROWS) logRows.length = LOG_MAX_ROWS;
+        renderLogs();
+      } catch (e) { /* ignore malformed frame */ }
+    });
+    logEventSource.addEventListener('error', () => {
+      // EventSource auto-reconnects; reflect the transient drop in the badge.
+      setLogStatus('off');
+    });
+    setLogStatus(logPaused ? 'paused' : 'live');
+  }
+  function stopLogStream() {
+    if (logEventSource) {
+      logEventSource.close();
+      logEventSource = null;
+    }
+    setLogStatus('off');
+  }
+  function toggleLogPause() {
+    logPaused = !logPaused;
+    const btn = $('logPauseBtn');
+    if (btn) {
+      btn.querySelector('.btn-text').textContent = logPaused ? t('logs.resume') : t('logs.pause');
+      const icon = btn.querySelector('i');
+      if (icon) icon.className = logPaused ? 'fa-solid fa-play' : 'fa-solid fa-pause';
+    }
+    setLogStatus(logEventSource ? (logPaused ? 'paused' : 'live') : 'off');
+  }
+  function clearLogs() {
+    logRows = [];
+    renderLogs();
+  }
+  function fmtLogTime(ms) {
+    const d = new Date(ms);
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+  function renderLogs() {
+    const body = $('logTableBody');
+    const empty = $('logEmpty');
+    if (!body) return;
+    if (logRows.length === 0) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+    body.innerHTML = logRows.map(e => {
+      const acct = getDisplayEmail(e.accountEmail, e.accountId);
+      const endpoint = e.endpoint === 'openai' ? 'OpenAI' : e.endpoint === 'responses' ? 'Responses' : 'Claude';
+      const streamTag = e.stream ? ' <span class="log-tag">SSE</span>' : '';
+      return '<tr>' +
+        '<td class="log-time">' + escapeHtml(fmtLogTime(e.time)) + '</td>' +
+        '<td>' + escapeHtml(acct) + '</td>' +
+        '<td class="log-ip">' + escapeHtml(e.clientIp || '-') + '</td>' +
+        '<td>' + escapeHtml(e.keyName || '-') + '</td>' +
+        '<td class="log-model"><span class="log-tag log-ep">' + escapeHtml(endpoint) + '</span> ' + escapeHtml(e.model || '-') + streamTag + '</td>' +
+        '<td class="num">' + formatNum(e.inputTokens || 0) + '</td>' +
+        '<td class="num">' + formatNum(e.outputTokens || 0) + '</td>' +
+        '<td class="num">' + formatNum(e.cacheRead || 0) + '</td>' +
+        '<td class="num">' + formatNum(e.cacheCreation || 0) + '</td>' +
+        '<td class="num">' + (e.credits || 0).toFixed(2) + '</td>' +
+        '</tr>';
+    }).join('');
   }
 
   // Event wiring
@@ -2596,6 +2783,9 @@
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
+    if ($('logPauseBtn')) $('logPauseBtn').addEventListener('click', toggleLogPause);
+    if ($('logClearBtn')) $('logClearBtn').addEventListener('click', clearLogs);
+
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
       const target = $(id);
@@ -2630,6 +2820,15 @@
 
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
+
+    if ($('accountsPagination')) {
+      $('accountsPagination').addEventListener('click', e => {
+        const btn = e.target.closest('.page-btn');
+        if (!btn || btn.disabled) return;
+        const p = parseInt(btn.dataset.page, 10);
+        if (!isNaN(p)) goToPage(p);
+      });
+    }
 
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
