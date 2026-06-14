@@ -70,8 +70,7 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 
 // UpdateApiKey applies a patch to an existing API key. Patch semantics:
 //   - Name, Key are overwritten when non-empty in patch.
-//   - Enabled, TokenLimit, CreditLimit, CacheHitRate are always overwritten
-//     (zero / nil values are valid: nil CacheHitRate means "use global default").
+//   - Enabled, TokenLimit, CreditLimit are always overwritten (zero values are valid).
 //   - Counters (TokensUsed/CreditsUsed/RequestsCount/Cache*) are not touched here;
 //     use RecordApiKeyUsage or ResetApiKeyUsage instead.
 //   - Migrated stays as-is once true; only flips when explicitly set in patch.
@@ -107,7 +106,6 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
-	cfg.ApiKeys[idx].CacheHitRate = patch.CacheHitRate
 	if patch.Migrated {
 		cfg.ApiKeys[idx].Migrated = true
 	}
@@ -161,14 +159,16 @@ func HasApiKeys() bool {
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
 // updates LastUsedAt, increments RequestsCount, and persists.
 func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
-	return RecordApiKeyUsageWithCache(id, tokens, credits, 0, 0)
+	return RecordApiKeyUsageWithCache(id, tokens, credits, 0, 0, 0)
 }
 
-// RecordApiKeyUsageWithCache is RecordApiKeyUsage plus cache-token attribution.
+// RecordApiKeyUsageWithCache is RecordApiKeyUsage plus prompt-cache attribution.
 // cacheRead / cacheCreation are the reported prompt-cache token counts for this
-// request; they are accumulated for per-key hit-rate display. Negative values
-// are ignored.
-func RecordApiKeyUsageWithCache(id string, tokens int64, credits float64, cacheRead, cacheCreation int64) error {
+// request; cacheInput is the input-token basis they were reported against
+// (read + creation + downstream-billed). All three are accumulated so the admin
+// view can show CacheReadTokens / CacheInputTokens as the observed simulated hit
+// rate. Negative values are ignored.
+func RecordApiKeyUsageWithCache(id string, tokens int64, credits float64, cacheRead, cacheCreation, cacheInput int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -187,6 +187,9 @@ func RecordApiKeyUsageWithCache(id string, tokens int64, credits float64, cacheR
 			}
 			if cacheCreation > 0 {
 				cfg.ApiKeys[i].CacheCreationTokens += cacheCreation
+			}
+			if cacheInput > 0 {
+				cfg.ApiKeys[i].CacheInputTokens += cacheInput
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
@@ -212,6 +215,7 @@ func ResetApiKeyUsage(id string) error {
 			cfg.ApiKeys[i].RequestsCount = 0
 			cfg.ApiKeys[i].CacheReadTokens = 0
 			cfg.ApiKeys[i].CacheCreationTokens = 0
+			cfg.ApiKeys[i].CacheInputTokens = 0
 			return saveLocked()
 		}
 	}

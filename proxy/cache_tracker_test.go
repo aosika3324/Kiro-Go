@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// computeUsage runs Compute and converts the returned fractions back to absolute
+// token counts against the profile's total input, so tests can assert on
+// read/creation token counts the way the handler ultimately reports them.
+func computeUsage(t *promptCacheTracker, keyID string, profile *promptCacheProfile) promptCacheUsage {
+	fracs := t.Compute(keyID, profile)
+	return applyCacheFractions(profile.TotalInputTokens, fracs)
+}
+
 func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 	tracker := newPromptCacheTracker(time.Hour)
 	longSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
@@ -28,7 +36,7 @@ func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 		t.Fatalf("expected cache profile to be built")
 	}
 
-	first := tracker.Compute("acct-1", profile)
+	first := computeUsage(tracker, "key-1", profile)
 	if first.CacheCreationInputTokens <= 0 {
 		t.Fatalf("expected first request to create cache tokens, got %+v", first)
 	}
@@ -36,13 +44,89 @@ func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 		t.Fatalf("expected first request to have zero cache reads, got %+v", first)
 	}
 
-	tracker.Update("acct-1", profile)
-	second := tracker.Compute("acct-1", profile)
+	tracker.Update("key-1", profile)
+	second := computeUsage(tracker, "key-1", profile)
 	if second.CacheReadInputTokens <= 0 {
 		t.Fatalf("expected repeated request to read cache tokens, got %+v", second)
 	}
 	if second.CacheCreationInputTokens != 0 {
 		t.Fatalf("expected repeated request to avoid cache creation, got %+v", second)
+	}
+}
+
+// TestPromptCacheIsolatedPerKey verifies the cache bucket is keyed by API key,
+// not by account: a prefix stored under key-1 must NOT be readable by key-2.
+func TestPromptCacheIsolatedPerKey(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	longSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": longSystem,
+				"cache_control": map[string]interface{}{
+					"type": "ephemeral",
+				},
+			},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "hello world"}},
+	}
+	profile := tracker.BuildClaudeProfile(req, 2048)
+	if profile == nil {
+		t.Fatalf("expected cache profile to be built")
+	}
+
+	tracker.Update("key-1", profile)
+
+	// key-2 has never seen this prefix → must report creation, not a read.
+	other := computeUsage(tracker, "key-2", profile)
+	if other.CacheReadInputTokens != 0 {
+		t.Fatalf("expected no cross-key cache read, got %+v", other)
+	}
+	if other.CacheCreationInputTokens <= 0 {
+		t.Fatalf("expected key-2 to create its own cache entry, got %+v", other)
+	}
+}
+
+// TestPromptCacheHitAcrossRoundRobinAccounts verifies the simulated cache hits
+// regardless of which upstream account served the prior turn: the cache is keyed
+// by API key, so account round-robin is irrelevant. Two Update/Compute cycles
+// under the same key must produce a read on the second turn.
+func TestPromptCacheHitAcrossRoundRobinAccounts(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+	baseSystem := []interface{}{
+		map[string]interface{}{
+			"type":          "text",
+			"text":          systemText,
+			"cache_control": map[string]interface{}{"type": "ephemeral"},
+		},
+	}
+
+	// Turn 1 served by "account A" — but the tracker only sees the API key.
+	req1 := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   baseSystem,
+		Messages: []ClaudeMessage{{Role: "user", Content: "question one"}},
+	}
+	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	tracker.Update("shared-key", profile1)
+
+	// Turn 2 served by a DIFFERENT account, same API key and same prefix.
+	req2 := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: baseSystem,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "question one"},
+			{Role: "assistant", Content: "answer one"},
+			{Role: "user", Content: "follow-up question"},
+		},
+	}
+	profile2 := tracker.BuildClaudeProfile(req2, 4096)
+	result := computeUsage(tracker, "shared-key", profile2)
+	if result.CacheReadInputTokens == 0 {
+		t.Fatalf("expected cache read regardless of account round-robin, got %+v", result)
 	}
 }
 
@@ -107,18 +191,18 @@ func TestPromptCacheStableAcrossBillingHeaderDrift(t *testing.T) {
 	if profile1 == nil {
 		t.Fatalf("profile1 should be built")
 	}
-	first := tracker.Compute("acct-1", profile1)
+	first := computeUsage(tracker, "key-1", profile1)
 	if first.CacheReadInputTokens != 0 {
 		t.Fatalf("expected no cache read on first request, got %+v", first)
 	}
-	tracker.Update("acct-1", profile1)
+	tracker.Update("key-1", profile1)
 
 	req2 := build("x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb; padding=xxyyzz;")
 	profile2 := tracker.BuildClaudeProfile(req2, 2048)
 	if profile2 == nil {
 		t.Fatalf("profile2 should be built")
 	}
-	second := tracker.Compute("acct-1", profile2)
+	second := computeUsage(tracker, "key-1", profile2)
 	if second.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read after billing header drift, got %+v", second)
 	}
@@ -154,13 +238,13 @@ func TestPromptCacheStableWhenBillingHeaderAppearsOrDisappears(t *testing.T) {
 	if withBilling == nil {
 		t.Fatalf("profile with billing header should be built")
 	}
-	tracker.Update("acct-1", withBilling)
+	tracker.Update("key-1", withBilling)
 
 	withoutBilling := tracker.BuildClaudeProfile(build(false), 2048)
 	if withoutBilling == nil {
 		t.Fatalf("profile without billing header should be built")
 	}
-	result := tracker.Compute("acct-1", withoutBilling)
+	result := computeUsage(tracker, "key-1", withoutBilling)
 	if result.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read when billing header disappears, got %+v", result)
 	}
@@ -239,7 +323,7 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	if profile1 == nil {
 		t.Fatalf("profile1 should be built")
 	}
-	tracker.Update("acct-1", profile1)
+	tracker.Update("key-1", profile1)
 
 	// Round 2: conversation continues with new messages. The latest user
 	// message has no explicit cache_control; it should still hit the stored
@@ -257,64 +341,120 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	if profile2 == nil {
 		t.Fatalf("profile2 should be built")
 	}
-	result := tracker.Compute("acct-1", profile2)
+	result := computeUsage(tracker, "key-1", profile2)
 	if result.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
 	}
 }
 
-func TestResolveReportedCacheUsagePrefersTrackedData(t *testing.T) {
-	tracked := promptCacheUsage{
-		CacheReadInputTokens:       800,
-		CacheCreationInputTokens:   200,
-		CacheCreation5mInputTokens: 200,
+// TestApplyCacheFractionsConservesTokens verifies cache_read + cache_creation +
+// billed always equals the input-token basis, and the TTL tier breakdown sums to
+// the creation total.
+func TestApplyCacheFractionsConservesTokens(t *testing.T) {
+	fracs := cacheFractions{
+		ReadFrac:       0.6,
+		CreationFrac:   0.2,
+		Creation5mFrac: 0.15,
+		Creation1hFrac: 0.05,
 	}
-	// Even with a policy rate set, real tracked data wins verbatim.
-	got := resolveReportedCacheUsage(2000, 0.5, tracked)
-	if got != tracked {
-		t.Fatalf("expected tracked usage returned verbatim, got %+v", got)
+	usage := applyCacheFractions(1000, fracs)
+	billed := billedClaudeInputTokens(1000, usage)
+	if billed+usage.CacheReadInputTokens+usage.CacheCreationInputTokens != 1000 {
+		t.Fatalf("token conservation violated: billed=%d read=%d creation=%d",
+			billed, usage.CacheReadInputTokens, usage.CacheCreationInputTokens)
 	}
-}
-
-func TestResolveReportedCacheUsageFallsBackToPolicyRate(t *testing.T) {
-	// No tracked data → use the policy hit rate to synthesize cache_read.
-	got := resolveReportedCacheUsage(1000, 0.7, promptCacheUsage{})
-	if got.CacheReadInputTokens != 700 {
-		t.Fatalf("expected 700 cache_read at rate 0.7, got %d", got.CacheReadInputTokens)
-	}
-	if got.CacheCreationInputTokens != 0 {
-		t.Fatalf("policy hits must report 0 creation, got %d", got.CacheCreationInputTokens)
-	}
-	// Conservation: billed + read + creation == input.
-	billed := billedClaudeInputTokens(1000, got)
-	if billed+got.CacheReadInputTokens+got.CacheCreationInputTokens != 1000 {
-		t.Fatalf("token conservation violated: billed=%d read=%d creation=%d", billed, got.CacheReadInputTokens, got.CacheCreationInputTokens)
+	if usage.CacheCreation5mInputTokens+usage.CacheCreation1hInputTokens != usage.CacheCreationInputTokens {
+		t.Fatalf("ttl breakdown must sum to creation total: 5m=%d 1h=%d creation=%d",
+			usage.CacheCreation5mInputTokens, usage.CacheCreation1hInputTokens, usage.CacheCreationInputTokens)
 	}
 }
 
-func TestResolveReportedCacheUsageZeroRateReportsNothing(t *testing.T) {
-	got := resolveReportedCacheUsage(1000, 0, promptCacheUsage{})
-	if got.CacheReadInputTokens != 0 || got.CacheCreationInputTokens != 0 {
-		t.Fatalf("zero rate must report no cache, got %+v", got)
+// TestApplyCacheFractionsNeverExceedsInput verifies read + creation are clamped
+// so the downstream-billed remainder is never negative even with noisy fractions.
+func TestApplyCacheFractionsNeverExceedsInput(t *testing.T) {
+	fracs := cacheFractions{ReadFrac: 0.9, CreationFrac: 0.9}
+	usage := applyCacheFractions(1000, fracs)
+	if usage.CacheReadInputTokens+usage.CacheCreationInputTokens > 1000 {
+		t.Fatalf("read+creation exceeded input: read=%d creation=%d",
+			usage.CacheReadInputTokens, usage.CacheCreationInputTokens)
 	}
 }
 
-func TestResolveReportedCacheUsageClampsAndRounds(t *testing.T) {
-	// Rate >1 is clamped to full input.
-	got := resolveReportedCacheUsage(500, 1.5, promptCacheUsage{})
-	if got.CacheReadInputTokens != 500 {
-		t.Fatalf("rate>1 should clamp read to input(500), got %d", got.CacheReadInputTokens)
-	}
-	// Rounding: 333 * 0.5 = 166.5 → 167.
-	got = resolveReportedCacheUsage(333, 0.5, promptCacheUsage{})
-	if got.CacheReadInputTokens != 167 {
-		t.Fatalf("expected rounded 167, got %d", got.CacheReadInputTokens)
+func TestApplyCacheFractionsZeroInputSafe(t *testing.T) {
+	usage := applyCacheFractions(0, cacheFractions{ReadFrac: 0.9})
+	if usage.CacheReadInputTokens != 0 || usage.CacheCreationInputTokens != 0 {
+		t.Fatalf("zero input must report no cache, got %+v", usage)
 	}
 }
 
-func TestResolveReportedCacheUsageZeroInputSafe(t *testing.T) {
-	got := resolveReportedCacheUsage(0, 0.9, promptCacheUsage{})
-	if got.CacheReadInputTokens != 0 {
-		t.Fatalf("zero input must report no cache, got %+v", got)
+func TestApplyCacheFractionsNoDataReportsNothing(t *testing.T) {
+	usage := applyCacheFractions(1000, cacheFractions{})
+	if usage.CacheReadInputTokens != 0 || usage.CacheCreationInputTokens != 0 {
+		t.Fatalf("empty fractions must report no cache, got %+v", usage)
+	}
+}
+
+// TestBuildOpenAIProfileMultiTurnHits verifies the OpenAI profile builder
+// produces breakpoints that hit across turns: a long stable system message plus
+// growing conversation should read cache on the second turn under the same key.
+func TestBuildOpenAIProfileMultiTurnHits(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+
+	req1 := &OpenAIRequest{
+		Model: "gpt-4o",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemText},
+			{Role: "user", Content: "question one"},
+		},
+	}
+	profile1 := tracker.BuildOpenAIProfile(req1, 2048)
+	if profile1 == nil {
+		t.Fatalf("expected OpenAI profile to be built")
+	}
+	first := computeUsage(tracker, "key-1", profile1)
+	if first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected no cache read on first OpenAI turn, got %+v", first)
+	}
+	tracker.Update("key-1", profile1)
+
+	req2 := &OpenAIRequest{
+		Model: "gpt-4o",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemText},
+			{Role: "user", Content: "question one"},
+			{Role: "assistant", Content: "answer one"},
+			{Role: "user", Content: "follow-up question"},
+		},
+	}
+	profile2 := tracker.BuildOpenAIProfile(req2, 4096)
+	if profile2 == nil {
+		t.Fatalf("expected second OpenAI profile to be built")
+	}
+	second := computeUsage(tracker, "key-1", profile2)
+	if second.CacheReadInputTokens == 0 {
+		t.Fatalf("expected OpenAI cache read on second turn, got %+v", second)
+	}
+}
+
+// TestMinCacheableTokensForModel pins the model-specific minimum cacheable
+// prompt length so the opus-everything-4096 bug doesn't regress.
+func TestMinCacheableTokensForModel(t *testing.T) {
+	cases := map[string]int{
+		"claude-opus-4.8":          1024,
+		"claude-sonnet-4.6":        1024,
+		"claude-sonnet-4.5":        1024,
+		"claude-sonnet-4":          1024,
+		"claude-opus-4.7":          2048,
+		"claude-opus-4.7-thinking": 2048,
+		"claude-opus-4.6":          4096,
+		"claude-opus-4.5":          4096,
+		"claude-haiku-4.5":         4096,
+		"some-unknown-model":       1024,
+	}
+	for model, want := range cases {
+		if got := minCacheableTokensForModel(model); got != want {
+			t.Errorf("minCacheableTokensForModel(%q) = %d, want %d", model, got, want)
+		}
 	}
 }

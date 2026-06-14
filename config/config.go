@@ -137,21 +137,22 @@ type ApiKeyEntry struct {
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
 
-	// CacheHitRate is this key's reported prompt-cache hit ratio (0.0–1.0), used
-	// as the policy fallback when no real prefix-cache tracking data is available
-	// for a request. nil means "use the global DefaultCacheHitRate". This only
-	// shapes the cache_read/cache_creation numbers reported downstream; it does
-	// not change how the upstream account is actually billed.
-	CacheHitRate *float64 `json:"cacheHitRate,omitempty"`
-
 	// Cumulative usage (never auto-reset)
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
 
-	// Cumulative cache token attribution (for per-key hit-rate display).
+	// Cumulative prompt-cache attribution, used to display this key's observed
+	// simulated hit rate. CacheReadTokens / CacheCreationTokens are the reported
+	// read / creation token counts; CacheInputTokens is the cumulative input
+	// token basis (read + creation + downstream-billed) those were reported
+	// against. The observed hit rate is CacheReadTokens / CacheInputTokens, which
+	// shares one token basis between numerator and denominator and is therefore
+	// naturally bounded by 1. These numbers shape only what is reported
+	// downstream; they do not change how the upstream Kiro account is billed.
 	CacheReadTokens     int64 `json:"cacheReadTokens,omitempty"`
 	CacheCreationTokens int64 `json:"cacheCreationTokens,omitempty"`
+	CacheInputTokens    int64 `json:"cacheInputTokens,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -184,13 +185,6 @@ type Config struct {
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
-
-	// DefaultCacheHitRate is the fallback reported prompt-cache hit ratio (0.0–1.0)
-	// applied when a request has no real prefix-cache tracking data and the matched
-	// API key has no per-key CacheHitRate. 0 means "report no cache hit by default".
-	// This only shapes the cache_* numbers reported downstream; it does not change
-	// how the upstream account is actually billed.
-	DefaultCacheHitRate float64 `json:"defaultCacheHitRate,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
@@ -853,59 +847,6 @@ func UpdateAllowOverUsage(allow bool) error {
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
 	return Save()
-}
-
-// clampHitRate constrains a cache hit ratio to the valid [0, 1] range.
-func clampHitRate(rate float64) float64 {
-	if rate < 0 {
-		return 0
-	}
-	if rate > 1 {
-		return 1
-	}
-	return rate
-}
-
-// GetDefaultCacheHitRate returns the global fallback cache hit ratio, clamped to [0, 1].
-func GetDefaultCacheHitRate() float64 {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return 0
-	}
-	return clampHitRate(cfg.DefaultCacheHitRate)
-}
-
-// UpdateDefaultCacheHitRate sets the global fallback cache hit ratio and persists it.
-// The value is clamped to [0, 1] before saving.
-func UpdateDefaultCacheHitRate(rate float64) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.DefaultCacheHitRate = clampHitRate(rate)
-	return Save()
-}
-
-// ResolveCacheHitRate returns the effective reported cache hit ratio for the given
-// API key ID: the key's own CacheHitRate when set, otherwise the global default.
-// An empty keyID (legacy / unauthenticated path) falls back to the global default.
-// The result is clamped to [0, 1].
-func ResolveCacheHitRate(keyID string) float64 {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return 0
-	}
-	if keyID != "" {
-		for i := range cfg.ApiKeys {
-			if cfg.ApiKeys[i].ID == keyID {
-				if cfg.ApiKeys[i].CacheHitRate != nil {
-					return clampHitRate(*cfg.ApiKeys[i].CacheHitRate)
-				}
-				break
-			}
-		}
-	}
-	return clampHitRate(cfg.DefaultCacheHitRate)
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".

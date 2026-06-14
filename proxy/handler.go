@@ -877,8 +877,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
-		messageStartUsage = cacheUsage
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
+		// message_start carries provisional cache numbers against the estimator
+		// basis; the final message_delta below re-applies the same fractions to the
+		// settled input-token basis.
+		messageStartUsage = applyCacheFractions(startInputTokens, cacheFracs)
 
 		var inputTokens, outputTokens int
 		var credits float64
@@ -1232,15 +1235,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		// Hybrid reporting: real prefix-tracker data when available, otherwise the
-		// per-key / global policy hit rate. message_start already carried the
-		// provisional tracked usage; message_delta below carries the final numbers.
-		cacheUsage = resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), cacheUsage)
+		// Apply the simulated cache split to the settled input-token basis. Numerator
+		// (cache_read) and the recorded input basis now share one token basis, so the
+		// per-key observed hit rate stays in [0, 1].
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
 
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(apiKeyID, cacheProfile)
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1330,18 +1333,20 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
 func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
-	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, 0, 0)
+	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, 0, 0, 0)
 }
 
-// recordSuccessForApiKeyWithCache is recordSuccessForApiKey plus cache-token
-// attribution (the cache_read / cache_creation token counts reported downstream),
-// accumulated per key for hit-rate display.
-func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheRead, cacheCreation int) {
+// recordSuccessForApiKeyWithCache is recordSuccessForApiKey plus prompt-cache
+// attribution. cacheRead / cacheCreation are the reported read / creation token
+// counts; cacheInput is the input-token basis they were reported against
+// (read + creation + downstream-billed). All three are accumulated per key so the
+// admin view can show the observed simulated hit rate.
+func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheRead, cacheCreation, cacheInput int) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsageWithCache(apiKeyID, int64(inputTokens+outputTokens), credits, int64(cacheRead), int64(cacheCreation)); err != nil {
+	if err := config.RecordApiKeyUsageWithCache(apiKeyID, int64(inputTokens+outputTokens), credits, int64(cacheRead), int64(cacheCreation), int64(cacheInput)); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
 }
@@ -1367,7 +1372,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
 
 		var content string
 		var thinkingContent string
@@ -1424,14 +1429,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		// Hybrid reporting: real prefix-tracker data when available, otherwise the
-		// per-key / global policy hit rate.
-		cacheUsage = resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), cacheUsage)
+		// Apply the simulated cache split to the settled input-token basis so the
+		// per-key observed hit rate stays in [0, 1].
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
 
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(apiKeyID, cacheProfile)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1515,19 +1520,20 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	cacheProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1556,6 +1562,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
 
 		var toolCalls []ToolCall
 		var toolCallIndex int
@@ -1874,14 +1881,16 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		// OpenAI path has no prefix tracker; report the per-key / global policy
-		// hit rate as cached_tokens so downstream gateways (newapi) see a hit.
-		cacheUsage := resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), promptCacheUsage{})
+		// Apply the simulated prompt-cache split to the settled input-token basis
+		// and report cache_read as cached_tokens so downstream gateways (newapi)
+		// see a hit. Numerator and recorded input basis share one basis.
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
 		cachedTokens := cacheUsage.CacheReadInputTokens
 
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.promptCache.Update(apiKeyID, cacheProfile)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -1925,7 +1934,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1940,6 +1949,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
 
 		var content string
 		var reasoningContent string
@@ -1986,14 +1996,16 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		// OpenAI path has no prefix tracker; report the per-key / global policy
-		// hit rate as cached_tokens so downstream gateways (newapi) see a hit.
-		cacheUsage := resolveReportedCacheUsage(inputTokens, config.ResolveCacheHitRate(apiKeyID), promptCacheUsage{})
+		// Apply the simulated prompt-cache split to the settled input-token basis
+		// and report cache_read as cached_tokens so downstream gateways (newapi)
+		// see a hit. Numerator and recorded input basis share one basis.
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
 		cachedTokens := cacheUsage.CacheReadInputTokens
 
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.promptCache.Update(apiKeyID, cacheProfile)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, cachedTokens)
@@ -2943,12 +2955,11 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":              config.GetApiKey(),
-		"requireApiKey":       config.IsApiKeyRequired(),
-		"port":                config.GetPort(),
-		"host":                config.GetHost(),
-		"allowOverUsage":      config.GetAllowOverUsage(),
-		"defaultCacheHitRate": config.GetDefaultCacheHitRate(),
+		"apiKey":         config.GetApiKey(),
+		"requireApiKey":  config.IsApiKeyRequired(),
+		"port":           config.GetPort(),
+		"host":           config.GetHost(),
+		"allowOverUsage": config.GetAllowOverUsage(),
 	})
 }
 
@@ -2997,11 +3008,10 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey              *string  `json:"apiKey,omitempty"`
-		RequireApiKey       *bool    `json:"requireApiKey,omitempty"`
-		Password            string   `json:"password,omitempty"`
-		AllowOverUsage      *bool    `json:"allowOverUsage,omitempty"`
-		DefaultCacheHitRate *float64 `json:"defaultCacheHitRate,omitempty"`
+		ApiKey         *string `json:"apiKey,omitempty"`
+		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
+		Password       string  `json:"password,omitempty"`
+		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3024,15 +3034,6 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
-	}
-
-	// 更新全局默认缓存命中率（上报口径）
-	if req.DefaultCacheHitRate != nil {
-		if err := config.UpdateDefaultCacheHitRate(*req.DefaultCacheHitRate); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

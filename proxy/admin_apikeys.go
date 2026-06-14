@@ -22,32 +22,25 @@ type apiKeyView struct {
 	CreditsUsed   float64 `json:"creditsUsed"`
 	RequestsCount int64   `json:"requestsCount"`
 
-	// Cache reporting. CacheHitRate is the per-key configured ratio (nil = use
-	// global default); EffectiveHitRate is the observed read/(read+creation+billed)
-	// ratio derived from cumulative counters, for display.
-	CacheHitRate        *float64 `json:"cacheHitRate,omitempty"`
-	CacheReadTokens     int64    `json:"cacheReadTokens"`
-	CacheCreationTokens int64    `json:"cacheCreationTokens"`
-	EffectiveHitRate    float64  `json:"effectiveHitRate"`
+	// Cache reporting. CacheReadTokens / CacheCreationTokens are the cumulative
+	// reported prompt-cache token counts; CacheInputTokens is the cumulative
+	// input-token basis they were reported against. EffectiveHitRate is the
+	// observed simulated hit rate = CacheReadTokens / CacheInputTokens (shares one
+	// token basis, so it is naturally bounded by 1).
+	CacheReadTokens     int64   `json:"cacheReadTokens"`
+	CacheCreationTokens int64   `json:"cacheCreationTokens"`
+	CacheInputTokens    int64   `json:"cacheInputTokens"`
+	EffectiveHitRate    float64 `json:"effectiveHitRate"`
 }
 
 func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
-	// EffectiveHitRate = cacheRead / totalInputTokens, where total input across all
-	// requests is approximated by TokensUsed (input+output) minus output is not
-	// tracked separately; we report read / (read + creation + billed-input) using
-	// the cumulative cache counters against TokensUsed as the denominator.
+	// EffectiveHitRate is the observed simulated cache hit rate: cumulative
+	// cache_read tokens over the cumulative input-token basis those reads were
+	// reported against. Numerator and denominator share one basis (input tokens),
+	// so the ratio is naturally in [0, 1] without any clamp.
 	var effective float64
-	denom := float64(e.CacheReadTokens + e.CacheCreationTokens)
-	if e.TokensUsed > 0 {
-		// TokensUsed includes output; use cache read over total tokens as a
-		// conservative observed hit ratio.
-		denom = float64(e.TokensUsed)
-	}
-	if denom > 0 {
-		effective = float64(e.CacheReadTokens) / denom
-		if effective > 1 {
-			effective = 1
-		}
+	if e.CacheInputTokens > 0 {
+		effective = float64(e.CacheReadTokens) / float64(e.CacheInputTokens)
 	}
 	return apiKeyView{
 		ID:                  e.ID,
@@ -62,9 +55,9 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		TokensUsed:          e.TokensUsed,
 		CreditsUsed:         e.CreditsUsed,
 		RequestsCount:       e.RequestsCount,
-		CacheHitRate:        e.CacheHitRate,
 		CacheReadTokens:     e.CacheReadTokens,
 		CacheCreationTokens: e.CacheCreationTokens,
+		CacheInputTokens:    e.CacheInputTokens,
 		EffectiveHitRate:    effective,
 	}
 }
@@ -89,12 +82,11 @@ func (h *Handler) apiGetApiKey(w http.ResponseWriter, r *http.Request, id string
 }
 
 type apiKeyCreateRequest struct {
-	Name         string   `json:"name,omitempty"`
-	Key          string   `json:"key,omitempty"`
-	Enabled      *bool    `json:"enabled,omitempty"`
-	TokenLimit   int64    `json:"tokenLimit,omitempty"`
-	CreditLimit  float64  `json:"creditLimit,omitempty"`
-	CacheHitRate *float64 `json:"cacheHitRate,omitempty"`
+	Name        string  `json:"name,omitempty"`
+	Key         string  `json:"key,omitempty"`
+	Enabled     *bool   `json:"enabled,omitempty"`
+	TokenLimit  int64   `json:"tokenLimit,omitempty"`
+	CreditLimit float64 `json:"creditLimit,omitempty"`
 }
 
 func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
@@ -116,12 +108,11 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry, err := config.AddApiKey(config.ApiKeyEntry{
-		Name:         req.Name,
-		Key:          keyValue,
-		Enabled:      enabled,
-		TokenLimit:   req.TokenLimit,
-		CreditLimit:  req.CreditLimit,
-		CacheHitRate: req.CacheHitRate,
+		Name:        req.Name,
+		Key:         keyValue,
+		Enabled:     enabled,
+		TokenLimit:  req.TokenLimit,
+		CreditLimit: req.CreditLimit,
 	})
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -144,10 +135,6 @@ type apiKeyUpdateRequest struct {
 	Enabled     *bool    `json:"enabled,omitempty"`
 	TokenLimit  *int64   `json:"tokenLimit,omitempty"`
 	CreditLimit *float64 `json:"creditLimit,omitempty"`
-	// CacheHitRate is tri-state: field absent = unchanged; explicit null = clear
-	// (fall back to global default); number = set per-key rate. json.RawMessage
-	// lets us tell "absent" from "null".
-	CacheHitRate json.RawMessage `json:"cacheHitRate,omitempty"`
 }
 
 func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id string) {
@@ -180,21 +167,6 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	if req.CreditLimit != nil {
 		patch.CreditLimit = *req.CreditLimit
-	}
-	// Tri-state cacheHitRate: absent → keep existing; null → clear (use global
-	// default); number → set per-key rate (clamped on save).
-	if len(req.CacheHitRate) > 0 {
-		if string(req.CacheHitRate) == "null" {
-			patch.CacheHitRate = nil
-		} else {
-			var rate float64
-			if err := json.Unmarshal(req.CacheHitRate, &rate); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				json.NewEncoder(w).Encode(map[string]string{"error": "cacheHitRate must be a number or null"})
-				return
-			}
-			patch.CacheHitRate = &rate
-		}
 	}
 
 	if err := config.UpdateApiKey(id, patch); err != nil {
